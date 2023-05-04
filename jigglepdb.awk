@@ -1,7 +1,7 @@
 #! /bin/awk -f
 #
 #
-#        Jiggles a pdb file's coordinates by some random value                 -James Holton 4-11-23
+#        Jiggles a pdb file's coordinates by some random value                 -James Holton 4-19-23
 #        run like this:
 #
 #        jigglepdb.awk -v seed=2343 -v shift=1.0 old.pdb >! jiggled.pdb
@@ -14,6 +14,10 @@
 #           -v shift_scale=1 -v dry_shift_scale=1 \
 #           old.pdb >! jiggled.pdb
 #
+#        to just select alternate conformers and other partially-occupied atoms at random, but
+#        only move xyz positions very slightly, do this:
+#        jigglepdb.awk -v seed=$seed -v shift=byB -v shift_scale=0.01 \
+#           -v independent_confsel=1 multiconf.pdb | grep -v " 0.00 " >! oneconf.pdb
 #
 BEGIN {
 
@@ -276,6 +280,13 @@ END{
     sumocc = avgocc[sr]*nconfs;
     if(debug) print "REMARK DEBUG:",sr,"sum occ=",sumocc
 
+    if( (sumocc >= 0.989 || sumocc <= 1.011 ) && nconfs > 3)
+    {
+         # this is probably a screwup
+         roundoffsum=sumocc;
+         scale = 1/roundoffsum;
+    }
+
     if(sumocc == roundoffsum && scale != 1)
     {
       # high likelihood this is a round-off error
@@ -288,7 +299,7 @@ END{
         avgocc[csr]*=scale;
         csum+=avgocc[csr];
       }
-      print "REMARK WARNING: made occs sum to",csum,"for",sr;
+      print "REMARK WARNING: made occ sum=",sprintf("%.10g",sumocc)," scale to",csum,"for",sr;
     }
 
     if(global_confsel>=0)
