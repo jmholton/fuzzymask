@@ -170,12 +170,12 @@ xyzlim asu
 EOF
 
 foreach itr ( `seq 1 $recycles` )
-echo "recombining feathered mask with ffted version of itself: $itr of $recycles"
-map_scaleB.com feathered.map B=$filterB output=filtered.map clip=0 >> $logfile
+    echo "recombining feathered mask with ffted version of itself: $itr of $recycles"
+    map_scaleB.com feathered.map B=$filterB output=filtered.map clip=0 >> $logfile
 
-map_func.com -func max feathered.map filtered.map -output maxmix.map >> $logfile
+    map_func.com -func max feathered.map filtered.map -output maxmix.map >> $logfile
 
-cp maxmix.map feathered.map
+    cp maxmix.map feathered.map
 end
 
 # compute scale and B needed to generate specified radius and feather
@@ -193,6 +193,8 @@ map_scaleB.com maxmix.map B=$bevel_B scale=$bevel_scale output=expme.map
 map_func.com -func exp expme.map -output notmask.map >> $logfile
 map_func.com -func negate -param 1 notmask.map -output beveled.map >> $logfile
 
+echo "stretching range of significance mask: $lowprob : $highprob -> 0 : 1"
+rm -f temp.map stretched.map loclip.map clipped.map > /dev/null
 set mult = `echo $highprob $lowprob | awk '{print 1./($1-$2)}'`
 set offs = `echo $highprob $lowprob | awk '{print -$2/($1-$2)}'`
 # started out using mult=1.5 adn offs=-0.2
@@ -248,8 +250,22 @@ mapmask mapin sum.map mapout avg.map << EOF >> $logfile
 scale factor $scale
 axis X Y Z
 EOF
-cp avg.map squish_protein.map
-map_func.com -func negate squish_protein.map -outfile squish_solvent.map
+cp avg.map squish_protein_rough.map
+#map_func.com -func negate squish_protein.map -outfile squish_solvent_rough.map
+
+echo "stretching range of protein mask: $protein_lowprob : $protein_highprob -> 0 : 1"
+rm -f temp.map stretched.map loclip.map clipped.map > /dev/null
+set mult = `echo $protein_highprob $protein_lowprob | awk '{print 1./($1-$2)}'`
+set offs = `echo $protein_highprob $protein_lowprob | awk '{print -$2/($1-$2)}'`
+map_func.com -func mult -param $mult squish_protein_rough.map -output temp.map >> $logfile
+map_func.com -func add -param $offs temp.map -output stretched.map >> $logfile
+map_func.com -func max -param 0 stretched.map -output loclip.map >> $logfile
+map_func.com -func min -param 1 loclip.map -output clipped.map >> $logfile
+
+cp clipped.map squish_protein.map
+
+
+
 
 echo maps mult |\
 mapmask mapin1 squish_protein.map mapin2 significance.map mapout protein_mask.map >> $logfile
