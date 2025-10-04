@@ -1,20 +1,52 @@
 #! /bin/tcsh -f
 #
-# remove bulk solvent from Fobs
+# remove bulk solvent from Fobs  - ala "squeeze"   - James Holton  9-17-25
 #
-# requires Tc_maskify.com map_func.com 
+# requires Tc_maskify.com map_func.com map_scaleB.com
 #
 
-set pdbfile = refmacout.pdb
+set pdbfile = noH.pdb
 set mtzfile = refmacout.mtz
 set outfile = refme_minusol.mtz
-set FP = FP
-set mask_scale = 50
+set FP = "auto"
 set reso = "auto"
+set FC_subtract = FC_ALL,PHIC_ALL
+set FC_addback = FC,PHIC
+
+
+# B factor for enlarging Shannon voxels
+set ShannonB = 0
+
+# B factor to use when passing sharp probability mask through fft filter
+# setting to zero means no filter, very small value means just back-and-forth fft
+set filterB = 1e-6
+# number of times to pass mask through fft filter
+set recycles = 5
+
+# select buffer zone around significant difference peaks
+set radius = 0.5
+set bevel = 0.5
+
+# probabilities considered definitely there vs unlikely
+# protein map will be range-stretched to make this range equal 0-1
+set protein_highprob = 0.9
+set protein_lowprob = 0.1
+
+# probabilities considered definitely there vs unlikely
+#set highprob = 0.87
+#set lowprob = 0.145
+set highprob = 0.9
+set lowprob = 0.1
+
+#set squish_frac = 1.0
+#set probfilter_frac = 1.0
 
 set tempfile = ./tempfile
 set debug = 0
 
+set logfile = details.log
+
+set path = ( $path `dirname $0` )
 
 # read the command line to update variables and other settings
 foreach Arg ( $* )
@@ -46,38 +78,198 @@ end
 # shorthand for temp stuff
 set t = ${tempfile}
 
+if(! -e "$pdbfile") then
+    set BAD = "need pdb file: $pdbfile"
+    goto exit
+endif
+if(! -e "$mtzfile") then
+    set BAD = "need refmac output mtz file: $mtzfile"
+    goto exit
+endif
 
+foreach dependency ( map_scaleB.com map_func.com Tc_maskify.com )
+   echo -n "using: "
+   which $dependency
+   if( $status ) then
+       set BAD = "need $dependency in "'$'"path"
+       goto exit
+   endif
+end
 
-set hires = `echo $reso | awk '{print $1*0.9}'`
+echo header | mtzdump hklin $mtzfile >! ${t}mtzdump.txt
+set SGnum = `awk '/Space group =/{print $NF+0}' ${t}mtzdump.txt | tail -n 1`
+set symops = `awk -v n=$SGnum '$1==n{print $3;exit}' ${CLIBD}/symop.lib`
+set CELL = `awk '/Cell Dimensions/{getline;getline;print $1+0,$2+0,$3+0,$4+0,$5+0,$6+0;exit}' ${t}mtzdump.txt`
+echo $CELL |\
+awk 'NF==6{DTR=atan2(1,1)/45; A=cos(DTR*$4); B=cos(DTR*$5); G=cos(DTR*$6); \
+ skew = 1 + 2*A*B*G - A*A - B*B - G*G ; if(skew < 0) skew = -skew;\
+ printf "%.3f\n", $1*$2*$3*sqrt(skew)}' |\
+cat >! ${t}volume
+set CELLvolume = `cat ${t}volume`
+rm -f ${t}volume
 
-fft hklin $mtzfile mapout ffted.map << EOF
-labin F1=FP F2=FC_ALL PHI=PHIC_ALL
+if( "$reso" == "auto" ) then
+   set reso = `awk '/Resolution Range/{getline;getline;print $6}' ${t}mtzdump.txt`
+   echo "resolution in $mtzfile is $reso"
+endif
+if( "$FP" == "auto" ) then
+   cat ${t}mtzdump.txt |\
+   awk '/^ H K L /{for(i=1;i<=NF;++i)label[i]=$i}\
+        /^ H H H /{for(i=1;i<=NF;++i)print $i,label[i]}' |\
+   egrep -v FC |\
+   awk '$1=="F"{print $2}' >! ${t}Fs.txt
+   set FP = `head -n 1 ${t}Fs.txt`
+   echo "selecting Fobs = $FP"
+endif
+set hires = `echo $reso | awk '{print (($1**3)*0.8)**0.3333}'`
+
+echo "making $FP - $FC_subtract difference map"
+set FC = `echo $FC_subtract | awk -F "," '{print $1}'`
+set PHIC = `echo $FC_subtract | awk -F "," '{print $2}'`
+fft hklin $mtzfile mapout ffted.map << EOF >! $logfile
+labin F1=$FP F2=$FC PHI=$PHIC
 reso $hires
 EOF
-echo xyzlim asu | mapmask mapin ffted.map mapout fofc.map 
+mapmask mapin ffted.map mapout fofc.map << EOF >> $logfile
+xyzlim asu
+axis X Y Z
+EOF
 
+echo | mapdump mapin fofc.map >! ${t}mapdump.txt
+
+
+# ' "probability that something is there" '
+# ' prob(rho) = sign(rho)*pow(erf(abs(rho/sigma(rho))/sqrt(2)),V/2/d^3) '
+
+
+
+
+# number of Shannon voxels expected
+set exponent = `echo $CELLvolume $symops $ShannonB | awk '{V=$1;n=$2;B=$3+$4;pi=atan2(1,1)*4;print V/n/2/(sqrt((B+9.484)*log(2))/pi)**3}'`
+echo "estimating $exponent Shannon voxels in ASU"
+
+echo "taking absolute value of Fo-Fc scaled to sigma=0.7071"
+mapmask mapin fofc.map mapout fofc_sigsqrt2.map << EOF >> $logfile
+scale sigma 0.70701 0
+EOF
+map_func.com -func abs  fofc_sigsqrt2.map -output abs.map >> $logfile
+echo "erfpow"
+map_func.com -func erfpow -param $exponent  abs.map -output erfpow.map >> $logfile
+
+echo | mapdump mapin erfpow.map >! ${t}mapdump.txt
+set xyzlim = `awk '/stop points on col/{gsub(":"," ");print $9,$10,$11,$12,$13,$14; exit}' ${t}mapdump.txt`
+set paddedlim = `echo $xyzlim | awk '{print $1-5,$2+5,$3-5,$4+5,$5-5,$6+5}'`
+
+mapmask mapin erfpow.map mapout padded.map << EOF >> $logfile
+xyzlim $paddedlim
+EOF
+echo "feather"
+map_func.com -func feather  padded.map -output padfeather.map >> $logfile
+mapmask mapin padfeather.map mapout feathered.map << EOF >> $logfile
+xyzlim asu
+EOF
+
+foreach itr ( `seq 1 $recycles` )
+echo "recombining feathered mask with ffted version of itself: $itr of $recycles"
+map_scaleB.com feathered.map B=$filterB output=filtered.map clip=0 >> $logfile
+
+map_func.com -func max feathered.map filtered.map -output maxmix.map >> $logfile
+
+cp maxmix.map feathered.map
+end
+
+# compute scale and B needed to generate specified radius and feather
+echo "selecting area within $radius A of selected voxels, beveled by $bevel A"
+echo $radius $bevel |\
+awk '{radius=$1;feather=$2;pi=4*atan2(1,1);\
+  rat = ((radius+feather/2)/radius)**2;\
+  s = (0.977322 - 0.159175*rat)/(rat - 1);\
+  B = -4*pi**2*radius**2/log(-log(0.5)*10**-s);\
+  print -(10**s),B}' >! ${t}sB.txt
+set bevel_scale = `awk '{print $1}' ${t}sB.txt`
+set bevel_B     = `awk '{print $2}' ${t}sB.txt`
+
+map_scaleB.com maxmix.map B=$bevel_B scale=$bevel_scale output=expme.map
+map_func.com -func exp expme.map -output notmask.map >> $logfile
+map_func.com -func negate -param 1 notmask.map -output beveled.map >> $logfile
+
+set mult = `echo $highprob $lowprob | awk '{print 1./($1-$2)}'`
+set offs = `echo $highprob $lowprob | awk '{print -$2/($1-$2)}'`
+# started out using mult=1.5 adn offs=-0.2
+map_func.com -func mult -param $mult beveled.map -output temp.map >> $logfile
+map_func.com -func add -param $offs temp.map -output stretched.map >> $logfile
+map_func.com -func max -param 0 stretched.map -output loclip.map >> $logfile
+map_func.com -func min -param 1 loclip.map -output clipped.map >> $logfile
+
+cp clipped.map significance.map
+
+
+echo "counting conformers"
 cat $pdbfile |\
-awk -v scale=$mask_scale '! /^ATOM|^HETAT/{print;next}\
-   {occ=substr($0,55,6);pre=substr($0,1,54);post=substr($0,61);\
-    newocc=occ*scale;}\
-   newocc>1{newocc=1}\
-   {printf("%s%6.2f%s\n",pre,newocc,post)}' |\
-cat >! maskme.pdb
-Tc_maskify.com fofc.map maskme.pdb
+awk '! /^ATOM|^HETAT/{next}\
+ {conf=substr($0,17,1);occ=substr($0,55,6);\
+  if(conf==" ")next;\
+  ++count[conf];sum[conf]+=occ}\
+ ! order[conf]{++c;order[conf]=c}\
+ END{for(conf in count){\
+   print order[conf],conf,sum[conf]/count[conf],count[conf]}}' |\
+sort -g |\
+tee ${t}conf_occ.txt 
 
-map_func.com -func negate mask.map -outfile solsquash_mask.map
 
-map_func.com -func multiply fofc.map solsquash_mask.map -outfile fofc_sqsh.map
+set masks = ""
+foreach cnfnum ( `awk '{print $1}' ${t}conf_occ.txt` )
+set cnfchar = `egrep "^${cnfnum} " ${t}conf_occ.txt | awk '{print $2}'`
 
-gemmi map2sf -v --dmin=$reso fofc_sqsh.map gemmi.mtz dF PHIdF 
-echo labin file 1 all | cad hklin1 gemmi.mtz hklout fofc_sqsh.mtz
-echo labin file 1 all | cad hklin1 $mtzfile hklout cadded.mtz
+echo "masking around conf $cnfchar "
 
+egrep "^${cnfnum} " ${t}conf_occ.txt |\
+cat - $pdbfile |\
+awk 'NR==1{selected=$2;avgocc=$3+1e-6;next}\
+  ! /^ATOM|^HETAT/{print;next}\
+    {conf=substr($0,17,1);occ=substr($0,55,6);\
+     pre=substr($0,1,54);post=substr($0,61)}\
+ conf==" "{print;next}\
+ conf!=selected{next}\
+    {occ=occ/avgocc}\
+  occ>1{occ=1} occ<0{occ=0}\
+  {printf("%s%6.2f%s\n",pre,occ,post)}' |\
+cat >! maskme_${cnfnum}.pdb
+Tc_maskify.com fofc.map maskme_${cnfnum}.pdb outfile=mask_${cnfnum}.map >! ${t}maskify_${cnfnum}.log
+set masks = ( $masks mask_${cnfnum}.map )
+end
+
+echo "averaging $#masks masks..."
+addup_maps_runme.com $masks >&! ${t}addup.log
+
+set scale = `echo $#masks | awk '{print 1/$1}'`
+
+mapmask mapin sum.map mapout avg.map << EOF >> $logfile
+scale factor $scale
+axis X Y Z
+EOF
+cp avg.map squish_protein.map
+map_func.com -func negate squish_protein.map -outfile squish_solvent.map
+
+echo maps mult |\
+mapmask mapin1 squish_protein.map mapin2 significance.map mapout protein_mask.map >> $logfile
+
+map_func.com -func negate protein_mask.map -outfile squish_solvent.map
+
+map_func.com -func multiply fofc.map squish_solvent.map -outfile fofc_resid.map
+
+gemmi map2sf -v --dmin=$reso fofc_resid.map gemmi.mtz dF PHIdF 
+echo labin file 1 all | cad hklin1 gemmi.mtz hklout fofc_resid.mtz  >> $logfile
+echo labin file 1 all | cad hklin1 $mtzfile hklout cadded.mtz >> $logfile
+
+echo "adding $FC_addback to residual to get new FP"
+set FC = `echo $FC_addback | awk -F "," '{print $1}'`
+set PHIC = `echo $FC_addback | awk -F "," '{print $2}'`
 rm -f new.mtz
-sftools << EOF
-read fofc_sqsh.mtz
-read cadded.mtz col FP SIGFP FC PHIC
-calc ( COL FP PHI ) = ( COL FC PHIC ) ( COL dF PHIdF ) +
+sftools << EOF >> $logfile
+read fofc_resid.mtz
+read cadded.mtz col FP SIGFP $FC $PHIC
+calc ( COL FP PHI ) = ( COL $FC $PHIC ) ( COL dF PHIdF ) +
 absent col FP if col SIGFP absent
 select col SIGFP = PRESENT
 purge nodata yes
@@ -86,8 +278,24 @@ write new.mtz col FP SIGFP
 quit
 y
 EOF
-cad hklin1 new.mtz hklin2 cadded.mtz hklout $outfile << EOF
+echo "cadding in FreeR_flag for final $outfile"
+cad hklin1 new.mtz hklin2 cadded.mtz hklout $outfile << EOF >> $logfile
 labin file 1 all
 labin file 2 E1=FreeR_flag
 EOF
+
+
+exit:
+
+if("$tempfile" == "") set  tempfile = "./"
+set tempdir = `dirname $tempfile`
+if(! $debug && ! ( "$tempdir" == "." || "$tempdir" == "" ) ) then
+    rm -f ${tempfile}*
+endif
+
+if($?BAD) then
+   echo "ERROR: $BAD"
+   exit 9
+endif
+exit
 
