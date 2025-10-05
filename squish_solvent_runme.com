@@ -9,6 +9,7 @@ set pdbfile = noH.pdb
 set mtzfile = refmacout.mtz
 set outfile = refme_minusol.mtz
 set FP = "auto"
+set FreeR_flag = "auto"
 set reso = "auto"
 set FC_subtract = FC_ALL,PHIC_ALL
 set FC_addback = FC,PHIC
@@ -96,7 +97,11 @@ foreach dependency ( map_scaleB.com map_func.com Tc_maskify.com )
    endif
 end
 
-echo header | mtzdump hklin $mtzfile >! ${t}mtzdump.txt
+echo header | mtzdump hklin $mtzfile |\
+   tee ${t}mtzdump.txt |\
+   awk '/^ H K L /{for(i=1;i<=NF;++i)label[i]=$i}\
+        /^ H H H /{for(i=1;i<=NF;++i)print $i,label[i]}' |\
+   cat >! ${t}labels.txt
 set SGnum = `awk '/Space group =/{print $NF+0}' ${t}mtzdump.txt | tail -n 1`
 set symops = `awk -v n=$SGnum '$1==n{print $3;exit}' ${CLIBD}/symop.lib`
 set CELL = `awk '/Cell Dimensions/{getline;getline;print $1+0,$2+0,$3+0,$4+0,$5+0,$6+0;exit}' ${t}mtzdump.txt`
@@ -113,15 +118,53 @@ if( "$reso" == "auto" ) then
    echo "resolution in $mtzfile is $reso"
 endif
 if( "$FP" == "auto" ) then
-   cat ${t}mtzdump.txt |\
-   awk '/^ H K L /{for(i=1;i<=NF;++i)label[i]=$i}\
-        /^ H H H /{for(i=1;i<=NF;++i)print $i,label[i]}' |\
+   cat  ${t}labels.txt |\
    egrep -v FC |\
    awk '$1=="F"{print $2}' >! ${t}Fs.txt
    set FP = `head -n 1 ${t}Fs.txt`
-   echo "selecting Fobs = $FP"
+   if( "$FP" == "" ) then
+      set BAD = "no Fobs in $mtzfile"
+      goto exit
+   endif
+   set SIGFP = `grep "Q $FP" ${t}labels.txt | awk '{print $2;exit}'`
+   if( "$SIGFP" == "" ) then
+      set SIGFP = `egrep "^Q " ${t}labels.txt | awk '{print $2;exit}'`
+   endif
+   if( "$SIGFP" == "" ) then
+      set BAD = "no sigFobs in $mtzfile"
+      goto exit
+   endif
+   echo "selecting Fobs = $FP $SIGFP"
+endif
+if( "$FreeR_flag" == "auto" ) then
+   cat  ${t}labels.txt |\
+   awk '$1=="I" && tolower($2)~/free/{print $2}' >! ${t}free.txt
+   set FreeR_flag = `head -n 1 ${t}free.txt`
+   if( "$FreeR_flag" == "" ) then
+      set FreeR_flag = `egrep "^I " ${t}labels.txt | awk '{print $2;exit}'`
+   endif
+   if( "$FreeR_flag" == "" ) then
+      set BAD = "no FreeR_flag in $mtzfile"
+      goto exit
+   endif
+   echo "selecting FreeR_flag = $FreeR_flag"
 endif
 set hires = `echo $reso | awk '{print (($1**3)*0.8)**0.3333}'`
+
+foreach FC ( $FC_subtract $FC_addback )
+  echo $FC |\
+   awk -F "," '{print $1,$2}' |\
+   cat - ${t}labels.txt |\
+   awk 'NR==1{F=$1;P=$2;next}\
+     {++seen[$2]}\
+     END{print seen[F],seen[P]}' >! ${t}test.txt
+  set test = `cat ${t}test.txt`
+  if( "$test" != "1 1" ) then
+    set BAD = "no $FC in $mtzfile"
+    goto exit
+  endif
+end
+
 
 echo "making $FP - $FC_subtract difference map"
 set FC = `echo $FC_subtract | awk -F "," '{print $1}'`
@@ -134,8 +177,28 @@ mapmask mapin ffted.map mapout fofc.map << EOF >> $logfile
 xyzlim asu
 axis X Y Z
 EOF
+fft hklin $mtzfile mapout ffted.map << EOF >! $logfile
+labin F1=$FP PHI=$PHIC
+reso $hires
+EOF
+mapmask mapin ffted.map mapout Fobs.map << EOF >> $logfile
+xyzlim asu
+axis X Y Z
+EOF
 
 echo | mapdump mapin fofc.map >! ${t}mapdump.txt
+
+
+foreach C ( C C_ALL C_ALL_LS )
+fft hklin $mtzfile mapout ffted.map << EOF >! $logfile
+labin F1=F$C PHI=PHI$C
+reso $hires
+EOF
+mapmask mapin ffted.map mapout F${C}.map << EOF >> $logfile
+xyzlim asu
+axis X Y Z
+EOF
+end
 
 
 # ' "probability that something is there" '
@@ -276,28 +339,43 @@ map_func.com -func multiply fofc.map squish_solvent.map -outfile fofc_resid.map
 
 gemmi map2sf -v --dmin=$reso fofc_resid.map gemmi.mtz dF PHIdF 
 echo labin file 1 all | cad hklin1 gemmi.mtz hklout fofc_resid.mtz  >> $logfile
-echo labin file 1 all | cad hklin1 $mtzfile hklout cadded.mtz >> $logfile
+
 
 echo "adding $FC_addback to residual to get new FP"
 set FC = `echo $FC_addback | awk -F "," '{print $1}'`
 set PHIC = `echo $FC_addback | awk -F "," '{print $2}'`
+cad hklin1 $mtzfile hklout cadded.mtz << EOF >> $logfile
+labin file 1 E1=$FP E2=$SIGFP E3=$FC E4=$PHIC
+labou file 1 E1=FP E2=SIGFP E3=FC E4=PHIC
+EOF
+
 rm -f new.mtz
 sftools << EOF >> $logfile
 read fofc_resid.mtz
-read cadded.mtz col FP SIGFP $FC $PHIC
-calc ( COL FP PHI ) = ( COL $FC $PHIC ) ( COL dF PHIdF ) +
+read cadded.mtz col FP SIGFP FC PHIC
+calc ( COL Fms PHI ) = ( COL FC PHIC ) ( COL dF PHIdF ) +
+calc F col FP = col Fms
 absent col FP if col SIGFP absent
 select col SIGFP = PRESENT
 purge nodata yes
 select all
-write new.mtz col FP SIGFP
+write new.mtz col FP SIGFP PHI
 quit
 y
 EOF
-echo "cadding in FreeR_flag for final $outfile"
-cad hklin1 new.mtz hklin2 cadded.mtz hklout $outfile << EOF >> $logfile
-labin file 1 all
-labin file 2 E1=FreeR_flag
+echo "cadding in $FreeR_flag for final $outfile"
+cad hklin1 new.mtz hklin2 $mtzfile hklout $outfile << EOF >> $logfile
+labin file 1 E1=FP E2=SIGFP
+labin file 2 E1=$FreeR_flag
+EOF
+
+fft hklin new.mtz mapout ffted.map << EOF >! $logfile
+labin F1=FP PHI=PHI
+reso $hires
+EOF
+mapmask mapin ffted.map mapout new_FP.map << EOF >> $logfile
+xyzlim asu
+axis X Y Z
 EOF
 
 
@@ -314,4 +392,30 @@ if($?BAD) then
    exit 9
 endif
 exit
+
+
+
+
+
+
+rm -f new.mtz
+sftools << EOF >> $logfile
+read fofc_resid.mtz
+read refmacout.mtz col FC PHIC
+calc ( COL FP PHI ) = ( COL FC PHIC ) ( COL dF PHIdF ) +
+absent col FP if col SIGFP absent
+select col SIGFP = PRESENT
+purge nodata yes
+select all
+write new.mtz col FP PHI
+quit
+y
+EOF
+fft hklin new.mtz mapout ffted.map << EOF >! $logfile
+labin F1=FP PHI=PHI
+EOF
+mapmask mapin ffted.map mapout new_FP.map << EOF >> $logfile
+xyzlim asu
+axis X Y Z
+EOF
 
