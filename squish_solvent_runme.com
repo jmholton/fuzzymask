@@ -1,6 +1,6 @@
 #! /bin/tcsh -f
 #
-# remove bulk solvent from Fobs  - ala "squeeze"   - James Holton  9-17-25
+# remove bulk solvent from Fobs  - ala "squeeze"   - James Holton  10-6-25
 #
 # requires Tc_maskify.com map_func.com map_scaleB.com
 #
@@ -13,6 +13,9 @@ set FreeR_flag = "auto"
 set reso = "auto"
 set FC_subtract = FC_ALL,PHIC_ALL
 set FC_addback = FC,PHIC
+
+# add back fraction of negative image of solvent difference features
+set squish_scale = -0.5
 
 
 # B factor for enlarging Shannon voxels
@@ -267,8 +270,9 @@ map_func.com -func max -param 0 stretched.map -output loclip.map >> $logfile
 map_func.com -func min -param 1 loclip.map -output clipped.map >> $logfile
 
 cp clipped.map significance.map
+# significance map reflects probability that the fo-fc feature is noise
 
-
+# now we need to mask out the protein
 echo "counting conformers"
 cat $pdbfile |\
 awk '! /^ATOM|^HETAT/{next}\
@@ -313,35 +317,41 @@ mapmask mapin sum.map mapout avg.map << EOF >> $logfile
 scale factor $scale
 axis X Y Z
 EOF
-cp avg.map squish_protein_rough.map
-#map_func.com -func negate squish_protein.map -outfile squish_solvent_rough.map
+cp avg.map not_protein_rough.map
+#map_func.com -func negate not_protein.map -outfile squish_solvent_rough.map
 
 echo "stretching range of protein mask: $protein_lowprob : $protein_highprob -> 0 : 1"
 rm -f temp.map stretched.map loclip.map clipped.map > /dev/null
 set mult = `echo $protein_highprob $protein_lowprob | awk '{print 1./($1-$2)}'`
 set offs = `echo $protein_highprob $protein_lowprob | awk '{print -$2/($1-$2)}'`
-map_func.com -func mult -param $mult squish_protein_rough.map -output temp.map >> $logfile
+map_func.com -func mult -param $mult not_protein_rough.map -output temp.map >> $logfile
 map_func.com -func add -param $offs temp.map -output stretched.map >> $logfile
 map_func.com -func max -param 0 stretched.map -output loclip.map >> $logfile
 map_func.com -func min -param 1 loclip.map -output clipped.map >> $logfile
 
-cp clipped.map squish_protein.map
-
+cp clipped.map not_protein.map
+# not protein is a map that is 0  around the protein and 1 far from it
 
 
 
 echo maps mult |\
-mapmask mapin1 squish_protein.map mapin2 significance.map mapout protein_mask.map >> $logfile
+mapmask mapin1 not_protein.map mapin2 significance.map mapout significant_solvent_mask.map >> $logfile
 
-map_func.com -func negate protein_mask.map -outfile squish_solvent.map
+map_func.com -func negate significant_solvent_mask.map -outfile squish_solvent_mask.map
 
-map_func.com -func multiply fofc.map squish_solvent.map -outfile fofc_resid.map
+map_func.com -func multiply fofc.map squish_solvent_mask.map -outfile fofc_squish_sol.map
 
-gemmi map2sf -v --dmin=$reso fofc_resid.map gemmi.mtz dF PHIdF 
-echo labin file 1 all | cad hklin1 gemmi.mtz hklout fofc_resid.mtz  >> $logfile
+map_func.com -func multiply fofc.map significant_solvent_mask.map -outfile fofc_sig_sol.map
 
+gemmi map2sf -v --dmin=$reso fofc_squish_sol.map gemmi.mtz dF PHIdF 
+echo labin file 1 all | cad hklin1 gemmi.mtz hklout fofc_squish_sol.mtz  >> $logfile
+gemmi map2sf -v --dmin=$reso fofc_sig_sol.map gemmi.mtz sF PHIsF 
+cad hklin1 gemmi.mtz hklout fofc_sig_sol.mtz << EOF >> $logfile
+labin file 1 all
+scale file 1 $squish_scale
+EOF
 
-echo "adding $FC_addback to residual to get new FP"
+echo "adding $FC_addback to modified fofc to get new FP"
 set FC = `echo $FC_addback | awk -F "," '{print $1}'`
 set PHIC = `echo $FC_addback | awk -F "," '{print $2}'`
 cad hklin1 $mtzfile hklout cadded.mtz << EOF >> $logfile
@@ -351,9 +361,11 @@ EOF
 
 rm -f new.mtz
 sftools << EOF >> $logfile
-read fofc_resid.mtz
+read fofc_squish_sol.mtz
+read fofc_sig_sol.mtz
 read cadded.mtz col FP SIGFP FC PHIC
 calc ( COL Fms PHI ) = ( COL FC PHIC ) ( COL dF PHIdF ) +
+calc ( COL Fms PHI ) = ( COL Fms PHI ) ( COL sF PHIsF ) +
 calc F col FP = col Fms
 absent col FP if col SIGFP absent
 select col SIGFP = PRESENT
