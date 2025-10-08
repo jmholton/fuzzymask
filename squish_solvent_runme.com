@@ -1,6 +1,6 @@
 #! /bin/tcsh -f
 #
-# remove bulk solvent from Fobs  - ala "squeeze"   - James Holton  10-6-25
+# remove bulk solvent from Fobs  - ala "squeeze"   - James Holton  9-17-25
 #
 # requires Tc_maskify.com map_func.com map_scaleB.com
 #
@@ -14,7 +14,6 @@ set reso = "auto"
 set FC_subtract = FC_ALL,PHIC_ALL
 set FC_addback = FC,PHIC
 
-# add back fraction of negative image of solvent difference features
 set squish_scale = -0.5
 
 
@@ -91,7 +90,7 @@ if(! -e "$mtzfile") then
     goto exit
 endif
 
-foreach dependency ( map_scaleB.com map_func.com Tc_maskify.com )
+foreach dependency ( map_scaleB.com map_func.com Tc_maskify.com addup_maps_runme.com )
    echo -n "using: "
    which $dependency
    if( $status ) then
